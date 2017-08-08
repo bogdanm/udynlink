@@ -1,0 +1,11 @@
+dependencies:
+  pre:
+    - sudo add-apt-repository ppa:team-gcc-arm-embedded/ppa
+    - sudo apt update
+    - sudo apt install gcc-arm-embedded
+    - sudo pip install subprocess32 pyelftools jinja2
+
+test:
+  override:
+    - cd tests
+    - python test_driver.py
