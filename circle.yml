@@ -1,11 +1,12 @@
 dependencies:
   pre:
-    - sudo add-apt-repository ppa:team-gcc-arm-embedded/ppa
-    - sudo apt update
-    - sudo apt install gcc-arm-embedded
-    - sudo pip install subprocess32 pyelftools jinja2
+    - sudo add-apt-repository -y ppa:team-gcc-arm-embedded/ppa
+    - sudo apt-get update
+    - sudo apt-get install -y gcc-arm-embedded libpython2.7-dev
+    - pip install subprocess32 pyelftools Jinja2
+    - wget https://github.com/gnu-mcu-eclipse/qemu/releases/download/gae-2.8.0-20170301/gnuarmeclipse-qemu-debian64-2.8.0-201703022210-head.tgz
+    - tar xvfz gnuarmeclipse-qemu-debian64-2.8.0-201703022210-head.tgz
 
 test:
   override:
-    - cd tests
-    - python test_driver.py
+    - export PATH=$PATH:$(readlink -f ./gnuarmeclipse/qemu/2.8.0-201703022210-head/bin) && cd tests && python ./test_driver.py
