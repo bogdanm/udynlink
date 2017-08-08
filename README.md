@@ -1,3 +1,5 @@
+![CircleCI](https://circleci.com/gh/bogdanm/udynlink.svg?style=shield&circle-token=8f507dac9e4c9d4e730416a21a8013eab6f9e952)
+
 # Overview
 
 `udynlink` is a dynamic linker for ARM Cortex-M MCUs. It compiles code into a binary blob that can be loaded and executed at runtime on the MCU. The binary blob can be either loaded into RAM or executed directly from the flash memory (execute in place). The dynamic linker can be used for various purposes, such as:
