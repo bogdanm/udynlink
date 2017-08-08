@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+
+import os, sys
+from udynlink_utils import *
+from jinja2 import FileSystemLoader
+from jinja2.environment import Environment
+import struct
+
+sectname_code = '.text'
+sectname_data = '.data'
+sectname_bss = '.bss'
+linker_script = os.path.join(os.path.dirname(__file__), "code_before_data.ld")
+
+################################################################################
+# Compilation
+################################################################################
+# TODO: the -fno-section-anchors below should probably be removed
+compile_cmd = "-fPIE -msingle-pic-base -mcpu=cortex-m4 -mthumb -fomit-frame-pointer -fno-inline -fno-section-anchors {extra} {input} -c -o {output}"
+asm_cmd = "-x assembler-with-cpp -mcpu=cortex-m4 -mthumb {input} -c -o {output}"
+link_cmd = "-mcpu=cortex-m4 -mthumb -T {ld} -nostartfiles -nodefaultlibs -nostdlib -Wl,--unresolved-symbols=ignore-in-object-files -Wl,--emit-relocs {input} -Wl,-e,0 -o {output}"
+
+def rename_symbols(src, dest, name_map, args):
+    cmdline = "arm-none-eabi-objcopy"
+    for n in name_map:
+        cmdline = cmdline + " --redefine-sym %s=%s" % (n, name_map[n])
+    cmdline = cmdline + " %s %s" % (src, dest)
+    execute(cmdline, args)
+
+def make_symbols_local(obj, symlist, args):
+    cmdline = "arm-none-eabi-objcopy"
+    for n in symlist:
+        cmdline = cmdline + " -L %s" % symlist[n]
+    cmdline = cmdline + " %s %s" % (obj, obj)
+    execute(cmdline, args)
+
+def assemble(src_name, args):
+    path, fname, ext = split_fname(src_name)
+    objname = fname + ".o"
+    asm_data = {"input": src_name, "output": os.path.join(path, objname)}
+    debug("Assembling '%s'" % src_name, args)
+    execute("arm-none-eabi-gcc " + asm_cmd.format(**asm_data), args)
+    return objname
+
+sym_renames = {}
+
+def compile(src_name, args, redefine_symbols = True, macros=[]):
+    path, fname, ext = split_fname(src_name)
+    objname = os.path.join(path, fname + ".o")
+    # Prepare compilation
+    extra = "" if args.pc_rel else "-mno-pic-data-is-text-relative"
+    if not args.no_long_calls:
+        extra += " -mlong-calls"
+    extra += " -O0" if args.no_opt else " -Os"
+    if macros:
+        extra = extra + " " + " ".join(macros)
+    compile_data = {"input": src_name, "extra": extra, "output": objname}
+    # Execute compile command
+    debug("Compiling '%s'" % src_name, args)
+    execute("arm-none-eabi-gcc " + compile_cmd.format(**compile_data), args)
+    # Relocate symbols if needed
+    if redefine_symbols:
+        # Generate temporary object file with renamed symbols
+        global_funcs = get_public_functions_in_object(objname)
+        debug("Generating temporary object files with wrapped symbols '%s'" % ", ".join(global_funcs), args)
+        temp_obj = os.path.join(path, fname + '.temp.o')
+        os.rename(objname, temp_obj)
+        sym_renames.clear()
+        sym_renames.update({n: get_wrapped_name(n) for n in global_funcs})
+        rename_symbols(temp_obj, objname, sym_renames, args)
+        # Generate ASM for prologue
+        debug("Generating ASM file for public function prologues", args)
+        loader = FileSystemLoader(os.path.dirname(os.path.abspath(__file__)))
+        env = Environment(loader = loader)
+        tmpl = env.get_template("asm_template.tmpl")
+        data = tmpl.render({"sym_names": sym_renames})
+        p_fname = os.path.join(path, fname + "_prologue.s")
+        with open(p_fname, "wt") as f:
+            f.write(str(data))
+        # Assemble prologue data
+        second_obj = assemble(p_fname, args)
+        os.remove(p_fname)
+        return [objname, second_obj]
+    else:
+        return [objname]
+
+def link(objects, output, args):
+    if output is None:
+        path, fname, ext = split_fname(args.source[0])
+        output = os.path.join(path, fname + ".elf")
+    # Prepare link
+    link_data = {"input": " ".join(objects), "output": output, "ld": linker_script}
+    debug("Linking (%s -> %s)" % (" + ".join(objects), output), args)
+    execute("arm-none-eabi-gcc " + link_cmd.format(**link_data), args)
+    # Change visibility of wrapped symbols to "local"
+    debug("Changing visiblity of wrapped symbols to 'local' in %s" % output, args)
+    make_symbols_local(output, sym_renames, args)
+
+def process(output, args):
+    # Read actual data and verify proper section placement
+    set_debug_col()
+    debug("%s Reading relevant sections %s" % ('-' * 10, '-' * 10), args)
+    # Code section
+    crt_off = 0
+    sect_idx_mapping = {}
+    cs = get_section_in_elf(output, sectname_code)
+    debug("Read section '%s' of size %d" % (sectname_code, cs["size"]), args)
+    check(cs["size"] % 4 == 0, "Length of section '%s' is not a multiple of 4" % sectname_code)
+    check(cs["addr"] == 0, "Section '%s' doesn't start at address 0" % sectname_code)
+    code_sect = bytearray(cs["data"])
+    crt_off += cs["size"]
+    sect_idx_mapping[cs["index"]] = sectname_code
+    # Data section
+    ds = get_section_in_elf(output, sectname_data)
+    debug("Read section '%s' of size %d" % (sectname_data, ds["size"]), args)
+    check(ds["size"] % 4 == 0, "Length of section '%s' is not a multiple of 4" % sectname_data)
+    check(ds["addr"] == crt_off, "Section '%s' doesn't begin after section '%s'" % (sectname_data, sectname_code))
+    data_sect = ds["data"]
+    crt_off += ds["size"]
+    sect_idx_mapping[ds["index"]] = sectname_data
+    # BSS section
+    bs = get_section_in_elf(output, sectname_bss)
+    debug("Read section '%s' of size %d" % (sectname_bss, bs["size"]), args)
+    check(bs["size"] % 4 == 0, "Length of section '%s' is not a multiple of 4" % sectname_bss)
+    check(bs["addr"] == crt_off, "Section '%s' doesn't begin after section '%s'" % (sectname_bss, sectname_data))
+    bss_sect = bs["data"]
+    sect_idx_mapping[bs["index"]] = sectname_bss
+    # Add a special key for undefined symbols
+    sect_idx_mapping["SHN_UNDEF"] = None
+
+    # Build the list of exported and unknown symbols
+    set_debug_col('cyan')
+    debug("%s Examining symbol table %s" % ('-' * 10, '-' * 10), args)
+    syms = get_symbols_in_elf(output)
+    rels = get_relocations_in_elf(output)
+    sym_map = RejectingDict()
+    for s, d in syms.items():
+        if not s or s == "$t" or s == "$d":
+            continue
+        if d["bind"] == "STB_GLOBAL":
+            defined = d["section"] != "SHN_UNDEF"
+            if defined:
+                sym_map[s] = "exported"
+                debug("Added symbol '%s' (%s) to list of exported symbols" % (s, syms[s]["type"]), args)
+            else:
+                sym_map[s] = "external"
+                debug("Added symbol '%s' (%s) to list of external symbols" % (s, syms[s]["type"]), args)
+        else:
+            if d["type"] == "STT_FILE":
+                continue
+            sym_map[s] = "local"
+            debug("Added symbol '%s' (%s) to list of local symbols" % (s, syms[s]["type"]), args)
+    print_list([s for s in sym_map if sym_map[s] == "exported"], "Exported :", args)
+    print_list([s for s in sym_map if sym_map[s] == "external"], "External :", args)
+    print_list([s for s in sym_map if sym_map[s] == "local"],"Locals   :", args)
+
+    # Process relocations
+    lot_entries, total_relocs = 0, 0
+    set_debug_col('yellow')
+    debug("%s Examining relocations %s" % ('-' * 10, '-' * 10), args)
+    local_relocs, foreign_relocs, rlist, ignored = [], [], [], {}
+    for r in rels:
+        s, t = r["name"], r["type"]
+        try:
+            offset, value = r["offset"], syms[s]["value"]
+        except KeyError:
+            if not ignored.get(s, False):
+                warn("Ingoring unknown symbol '%s' in relocation list" % s)
+                ignored[s] = True
+            continue
+        if t == "R_ARM_THM_CALL": # PC-relative, safe to ignore
+            debug("Ignoring relocation R_ARM_THM_CALL for symbol '%s' of type '%s'" % (s, syms[s]["type"]), args)
+            continue
+        elif t == "R_ARM_GOT_BREL":
+            if sym_map[s] == "local" or sym_map[s] == "exported":
+                debug("Found local relocation for symbol '%s' (offset is %X, value is %x)" % (s, offset, value), args)
+                local_relocs.append((s, offset, value))
+            elif sym_map[s] == "external":
+                debug("Found foreign relocation for symbol '%s' (offset is %X)" % (s, offset), args)
+                foreign_relocs.append((s, offset, value))
+            else:
+                error("Unknown relocation '%s' for symbol '%s'" % (t, s))
+            rlist.append(r)
+        elif t != "R_ARM_ABS32":
+            error("Unknown relocation type '%s' for symbol '%s'" % (t, s))
+    # Establish a mapping between symbol names and their positions in LOT using rlist above
+    # The mapping is arbitrary, but that's more than enough
+    # There's a single mapping for any symbol, even if there are multiple relocations for the symbol
+    reloc_name_to_idx = {}
+    for e in rlist:
+        if not reloc_name_to_idx.has_key(e["name"]):
+            reloc_name_to_idx[e["name"]] = lot_entries
+            lot_entries += 1
+            total_relocs += 1
+    # Data relocations deal with R_ARM_ABS32 relocs
+    delta_off, data_relocs = lot_entries, []
+    for r in rels:
+        s, t = r["name"], r["type"]
+        try:
+            offset, value = r["offset"], syms[s]["value"]
+        except KeyError:
+            if not ignored.get(s, False):
+                warn("Ignoring unknown symbol '%s' in relocation list" % s)
+                ignored[s] = True
+            continue
+        if t == "R_ARM_ABS32":
+            offset = (offset - len(code_sect)) / 4
+            check(offset >= 0, "Offset of R_ARM_ABS32 symbols '%s' should be positive or 0!" % s)
+            data_relocs.append((s, delta_off + offset, value))
+            debug("Found data relocation for symbol '%s' (offset is %X, value is %x)" % (s, delta_off + offset, value), args)
+            if not reloc_name_to_idx.has_key(s):
+                reloc_name_to_idx[s] = delta_off + offset
+                total_relocs += 1
+    print_list([l["name"] for l in rlist], "Final LOT relocation list:", args)
+    print_list([l[0] for l in data_relocs], "Final data relocation list:", args)
+    debug("Symbol positions in LOT: " + str(reloc_name_to_idx), args)
+
+    # Apply initial LOT relocations in .code
+    set_debug_col('green')
+    debug("%s Applying relocations according to symbol offsets in LOT %s" % ('-' * 10, '-' * 10), args)
+    # Apply local relocations: for each reloc, patch the binary to refer to the corresponding
+    # offset in the LOT
+    for r in local_relocs + foreign_relocs:
+        sym, offset, value = r
+        old = struct.unpack_from("<I", code_sect, offset)[0]
+        new = reloc_name_to_idx[sym] * 4
+        struct.pack_into("<I", code_sect, offset, new)
+        debug("Patched location %08X (old = %08X, new = %08X) for symbol '%s'" % (offset, old, new, sym), args)
+
+    # Prepare image
+    # The image starts with a header that looks like this:
+    # +--------------+--------------+---------------------------------------+
+    # | Field name   | Field size   | Meaning                               |
+    # +--------------+--------------+---------------------------------------+
+    # | sign         | 4            | Signature for module (always 'UDLM')  |
+    # | totlot       | 2            | Number of LOT entries                 |
+    # | totrels      | 2            | Total number of relocations           |
+    # | symtsize     | 4            | Size of symbol table, bytes (align 4) |
+    # | codesize     | 4            | Size of code, bytes (align 4)         |
+    # | datasize     | 4            | Size of data, bytes (align 4)         |
+    # | bsssize      | 4            | Size of bss, bytes (align 4)          |
+    # | <rels>       | 8*totrels    | Relocations                           |
+    # | <symt>       | symtsize     | Symbol table                          |
+    # +--------------+--------------+---------------------------------------+
+    # .code + .data (if any) follows immediately after this header
+    #
+    # Each local relocation is a (LOT offset, addend) pair
+    # Each foreign relocation is a (LOT offset, symt offset) pair
+    # The actual image comes after the data: code first, then .data (if any)
+
+    set_debug_col('magenta')
+    debug("%s Building image %s" % ('-' * 10, '-' * 10), args)
+    img = bytearray("UDLM") # Signature (4b)
+    # The first entry in the symbol table is always the module name
+    slist = [args.name] + [s for s in sym_map if reloc_name_to_idx.has_key(s) or sym_map[s] == "external" or sym_map[s] == "exported"]
+    img += struct.pack("<H", lot_entries) # LOT size (4b)
+    img += struct.pack("<H", total_relocs) # Total number of relocations (4b)
+    # Compute len of symbol table in advance (also name to symbol table index mapping (symt_mapping))
+    symt_len = len(slist) * 8 + 4 # 2 4-byte entry for each symbol: (offset to name, offset in image) + initial word which is the number of entries
+    symt_mapping = {}
+    for i, s in enumerate(slist):
+        if i == 0 or sym_map[s] != "local":
+            symt_len += len(s) + 1
+        symt_mapping[s] = i
+    symt_len = round_to(symt_len, 4)
+    debug("Size of symbol table is %d bytes" % symt_len, args)
+    img += struct.pack("<I", symt_len) # Size of symbol table in bytes (4b)
+    img += struct.pack("<I", len(code_sect)) # Size of code section (4b)
+    img += struct.pack("<I", len(data_sect)) # Size of data section (4b)
+    img += struct.pack("<I", len(bss_sect)) # Size of bss section (4b)
+    # Write relocations: (lot off, symy off) pairs
+    relocated = {}
+    for r in local_relocs + data_relocs + foreign_relocs:
+        sym, _, value = r
+        if relocated.get(sym, False):
+            continue
+        img += struct.pack("<II", reloc_name_to_idx[sym], symt_mapping[sym])
+        relocated[sym] = True
+        debug("Wrote %s relocation (%08X, %08X)" % ("foreign" if r in foreign_relocs else "local", reloc_name_to_idx[sym], symt_mapping[sym]), args)
+    # Write actual symbol table
+    off = len(slist) * 8 + 4
+    # First word is the numer of entries
+    img += struct.pack("<I", len(slist))
+    for i, s in enumerate(slist):
+        if i > 0: # regular symbol (not the module name).
+            # The "offset" part of the symbol def has only 28 bits usable as offset
+            # The most signifcant 4 bits encode data about the symbol itself:
+            #     31: always 0, except for the last entry marker (which is 0xFFFFFFFF)
+            #     30: 1 if in code section, 0 if in data section
+            #     29-28: visibility (0 = local, 1 = exported, 2 = external, 3 = module name). Local symbols do NOT have a name (offset is 0).
+            defined_in_code = sect_idx_mapping[syms[s]["section"]] == sectname_code
+            if sym_map[s] == "local":
+                type_data = 0
+            elif sym_map[s] == "exported":
+                type_data = 1
+            else: # external
+                type_data = 2
+            type_data |= 4 if defined_in_code else 0
+            val = syms[s]["value"]
+            # Symbols that are not in the code section (and are defined in the module) will have their value offseted with the
+            # start of the .data section in the image
+            val_offset = 0 if (sym_map[s] == "external" or defined_in_code) else len(code_sect)
+            if val_offset:
+                debug("    Symbol '%s' offset by -%08X bytes from value %08X" % (s, val_offset, val), args)
+            val = val - val_offset
+            s_off = (off if sym_map[s] != "local" else 0) | (type_data << 28)
+        else: # module name
+            val, s_off = 0, (3 << 28) | off
+        img += struct.pack("<II", s_off, val)
+        debug("Added symbol '%s' with value %08X and name offset %08X at index %d" % (s, val, s_off, i), args)
+        if i == 0 or sym_map[s] != "local": # local symbols don't have a name in the offset table
+            off = off + len(s) + 1
+    # Pass 2: write actual symbols
+    for i, s in enumerate(slist):
+        if i == 0 or sym_map[s] != "local":
+            img += s + '\0'
+    # Round to a multiple of 4
+    if len(img) % 4 > 0:
+        img += '\0' * (4 - len(img) % 4)
+    # And finally append the code
+    img = img + code_sect + data_sect
+    bin_name = args.name + ".bin"
+    with open(bin_name, "wb") as f:
+        f.write(img)
+    print "Image written to '%s'." % bin_name
+    set_debug_col()
+    return bin_name
+
+def disasm(output, args):
+    if args.disasm:
+        execute("arm-none-eabi-objdump -D -j .text -w -z %s" % output, args)
+
+def gen_c_header(bin_name, header_path, args):
+    path, fname, ext = split_fname(bin_name)
+    header_name = os.path.join(header_path, fname + "_module_data.h")
+    debug("Generating header '%s' from binary '%s'" % (bin_name, header_name), args)
+    with open(bin_name, "rb") as f:
+        bin_data = f.read()
+    with open(header_name, "wt") as f:
+        f.write("// Automatically generated header file\n\n")
+        f.write("static const unsigned char %s_module_data[] = {\n    " % fname)
+        cnt = 0
+        for idx, c in enumerate(bin_data):
+            f.write("0x%02X" % ord(c))
+            if idx < len(bin_data) - 1:
+                f.write(",")
+                cnt += 1
+                f.write("\n    " if cnt % 32 == 0 else " ")
+        f.write("\n};\n")
+
+################################################################################
+# Entry point
+################################################################################
+
+parser = get_arg_parser('Compilation script')
+# TODO: should all these args be kept? What about --pc-rel and --no-long-calls?
+parser.add_argument('--disasm', dest="disasm", action="store_true", help="Show disassembly (default: false)")
+parser.add_argument('--pc-rel', dest="pc_rel", action="store_true", help="Allow pc-relative addressing (default: false)")
+parser.add_argument('--no-long-calls', dest="no_long_calls", action="store_true", help="Do not use long calls (default: false)")
+parser.add_argument("--no-opt", dest="no_opt", action="store_true", help="Disable optimizations")
+parser.add_argument("--stop-after-compile", dest="stop_after_compile", action="store_true", help="Stop after compiling")
+parser.add_argument("--stop-after-link", dest="stop_after_link", action="store_true", help="Stop after linking")
+parser.add_argument("--gen-c-header", dest="gen_c_header", action="store_true", help="Generate the C header after processing (default: false)")
+parser.add_argument("--header-path", dest="header_path", default=".", help="Path for the generated header (default: current dir)")
+parser.add_argument("--name", dest="name", default=None, help="Module name (default is inferred from the namae of first source)")
+args, rest = parser.parse_known_args()
+if len(rest) == 0:
+    error("Empty file/macro list")
+# Look in "rest" for definitions (-Dmacro or -Dmacro=value)
+# The format is: first definitions, then list of files
+macros = []
+while len(rest) > 0 and rest[0].startswith("-D"):
+    macros.append(rest[0])
+    rest = rest[1:]
+if len(rest) == 0:
+    error("Empty file list")
+sources = rest
+if args.name is None:
+    _, name, _ = split_fname(sources[0])
+    args.name = name
+
+output, objects = change_ext(sources[0], '.elf'), []
+for s in sources:
+    objects.extend(compile(s, args, macros=macros))
+if args.stop_after_compile:
+    sys.exit(0)
+link(objects, output, args)
+if args.stop_after_link:
+    disasm(output, args)
+    sys.exit(0)
+bin_name = process(output, args)
+if args.gen_c_header:
+    gen_c_header(bin_name, args.header_path, args)
+disasm(output, args)
