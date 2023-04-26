@@ -40,7 +40,7 @@ static const char * const error_codes[] = {
 #define UDYNLINK_LOAD_IS_FOREIGN_RAM(p_mod)   ((p_mod->info & UDYNLINK_LOAD_FOREIGN_RAM_MASK) != 0)
 #define UDYNLINK_LOAD_SET_FOREIGN_RAM(p_mod)  p_mod->info |= UDYNLINK_LOAD_FOREIGN_RAM_MASK
 #define UDYNLINK_LOAD_CLR_FOREIGN_RAM(p_mod)  p_mod->info &= (uint8_t)~UDYNLINK_LOAD_FOREIGN_RAM_MASK
-
+#define UDYNLINK_ASM_PROLOGUE_LEN             18 // this shall match the preamble code length in bytes
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers - debug
 
@@ -407,6 +407,23 @@ udynlink_sym_t *udynlink_lookup_symbol(const udynlink_module_t *p_mod, const cha
         }
     }
     return NULL;
+}
+
+void udynlink_patch_exported_func(const udynlink_module_t *p_mod) {
+    uint32_t idx;
+    udynlink_sym_t sym;
+    for (uint32_t i = 0; i < UDYNLINK_MAX_HANDLES; i ++) { // iterate through all modules
+        if ((p_mod == NULL) || (p_mod == module_table + i)) { // but consider only the given one if not NULL
+            idx = 0;
+            while (get_sym_at(module_table + i, idx ++, &sym) != NULL) { // iterate through module's symbol table
+                if (sym.type     == UDYNLINK_SYM_TYPE_EXPORTED &&
+                    sym.location == UDYNLINK_SYM_LOCATION_CODE) {
+                    offset_sym(module_table + i, &sym);
+                    (*(uint32_t*) (sym.val + UDYNLINK_ASM_PROLOGUE_LEN)) = (uint32_t)&udynlink_get_lot_base;
+                }
+            }
+        }
+    }
 }
 
 uint32_t udynlink_get_symbol_value(const udynlink_module_t *p_mod, const char *name) {

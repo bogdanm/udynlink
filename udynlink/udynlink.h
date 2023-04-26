@@ -153,6 +153,9 @@ udynlink_module_t *udynlink_lookup_module(const char *name);
 // Returns p_sym if the symbol is found, false otherwise.
 udynlink_sym_t *udynlink_lookup_symbol(const udynlink_module_t *p_mod, const char *name, udynlink_sym_t *p_sym);
 
+// patch the exported functions with the address of the udynlink_get_lot_base function
+void udynlink_patch_exported_func(const udynlink_module_t *p_mod);
+
 // Lookup the given symbol. Returns its value if found, 0 otherwise.
 uint32_t udynlink_get_symbol_value(const udynlink_module_t *p_mod, const char *name);
 
