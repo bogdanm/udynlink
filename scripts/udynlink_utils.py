@@ -1,6 +1,7 @@
 import os, sys
 import argparse
 import hashlib
+import py3compat
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 from elftools.elf.sections import SymbolTableSection
@@ -39,7 +40,7 @@ def blue(s):
 
 def execute(cmd, args, exit_on_error = True):
     if not args.no_verbose:
-        print "[Executing] " + cmd
+        print ("[Executing] " + cmd)
     res = os.system(cmd)
     if (res != 0) and exit_on_error:
         sys.exit(1)
@@ -66,14 +67,15 @@ def change_ext(name, new_ext):
     return os.path.join(path, fname + new_ext)
 
 def get_wrapped_name(n):
-    s = hashlib.md5(n).hexdigest()
+    nb = py3compat.str2bytes(n)
+    s = hashlib.md5(nb).hexdigest()
     return "__%s__%s" % (s[:9], n)
 
 debug_col = 'blue'
 def debug(msg, args, col = None):
     if not args.no_debug:
         col = col or debug_col
-        print "%s %s" % (red("[debug]"), bold(msg, col))
+        print ("%s %s" % (red("[debug]"), bold(msg, col)))
 
 def set_debug_col(col = None):
     global debug_col
