@@ -173,8 +173,8 @@ def process(output, args):
                 warn("Ingoring unknown symbol '%s' in relocation list" % s)
                 ignored[s] = True
             continue
-        if t == "R_ARM_THM_CALL": # PC-relative, safe to ignore
-            debug("Ignoring relocation R_ARM_THM_CALL for symbol '%s' of type '%s'" % (s, syms[s]["type"]), args)
+        if t == "R_ARM_THM_CALL" or t == "R_ARM_CALL": # PC-relative, safe to ignore
+            debug("Ignoring relocation R_ARM_(THM)_CALL for symbol '%s' of type '%s'" % (s, syms[s]["type"]), args)
             continue
         elif t == "R_ARM_GOT_BREL":
             if sym_map[s] == "local" or sym_map[s] == "exported":
