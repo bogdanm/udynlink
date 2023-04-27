@@ -69,21 +69,22 @@ def compile(src_name, args, redefine_symbols = True, macros=[]):
         if os.path.isfile(temp_obj):
             os.remove(temp_obj)
         os.rename(objname, temp_obj)
-        sym_renames.clear()
-        sym_renames.update({n: get_wrapped_name(n) for n in global_funcs})
-        rename_symbols(temp_obj, objname, sym_renames, args)
+        local_sym_renames = {}
+        local_sym_renames.update({n: get_wrapped_name(n) for n in global_funcs})
+        rename_symbols(temp_obj, objname, local_sym_renames, args)
         # Generate ASM for prologue
         debug("Generating ASM file for public function prologues", args)
         loader = FileSystemLoader(os.path.dirname(os.path.abspath(__file__)))
         env = Environment(loader = loader)
         tmpl = env.get_template("asm_template.tmpl")
-        data = tmpl.render({"sym_names": sym_renames})
+        data = tmpl.render({"sym_names": local_sym_renames})
         p_fname = os.path.join(path, fname + "_prologue.s")
         with open(p_fname, "wt") as f:
             f.write(str(data))
         # Assemble prologue data
         second_obj = assemble(p_fname, args)
         os.remove(p_fname)
+        sym_renames.update(local_sym_renames)
         return [objname, second_obj]
     else:
         return [objname]
