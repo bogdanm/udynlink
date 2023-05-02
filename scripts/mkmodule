@@ -53,6 +53,9 @@ def compile(src_name, args, redefine_symbols = True, macros=[]):
     extra += " -O0" if args.no_opt else " -Os"
     if macros:
         extra = extra + " " + " ".join(macros)
+    if args.include_paths:
+        for ip in args.include_paths:
+            extra += " -I" + ip
     compile_data = {"input": src_name, "extra": extra, "output": objname}
     # Execute compile command
     debug("Compiling '%s'" % src_name, args)
@@ -63,22 +66,25 @@ def compile(src_name, args, redefine_symbols = True, macros=[]):
         global_funcs = get_public_functions_in_object(objname)
         debug("Generating temporary object files with wrapped symbols '%s'" % ", ".join(global_funcs), args)
         temp_obj = os.path.join(path, fname + '.temp.o')
+        if os.path.isfile(temp_obj):
+            os.remove(temp_obj)
         os.rename(objname, temp_obj)
-        sym_renames.clear()
-        sym_renames.update({n: get_wrapped_name(n) for n in global_funcs})
-        rename_symbols(temp_obj, objname, sym_renames, args)
+        local_sym_renames = {}
+        local_sym_renames.update({n: get_wrapped_name(n) for n in global_funcs})
+        rename_symbols(temp_obj, objname, local_sym_renames, args)
         # Generate ASM for prologue
         debug("Generating ASM file for public function prologues", args)
         loader = FileSystemLoader(os.path.dirname(os.path.abspath(__file__)))
         env = Environment(loader = loader)
         tmpl = env.get_template("asm_template.tmpl")
-        data = tmpl.render({"sym_names": sym_renames})
+        data = tmpl.render({"sym_names": local_sym_renames})
         p_fname = os.path.join(path, fname + "_prologue.s")
         with open(p_fname, "wt") as f:
             f.write(str(data))
         # Assemble prologue data
         second_obj = assemble(p_fname, args)
         os.remove(p_fname)
+        sym_renames.update(local_sym_renames)
         return [objname, second_obj]
     else:
         return [objname]
@@ -167,8 +173,8 @@ def process(output, args):
                 warn("Ingoring unknown symbol '%s' in relocation list" % s)
                 ignored[s] = True
             continue
-        if t == "R_ARM_THM_CALL": # PC-relative, safe to ignore
-            debug("Ignoring relocation R_ARM_THM_CALL for symbol '%s' of type '%s'" % (s, syms[s]["type"]), args)
+        if t == "R_ARM_THM_CALL" or t == "R_ARM_CALL": # PC-relative, safe to ignore
+            debug("Ignoring relocation R_ARM_(THM)_CALL for symbol '%s' of type '%s'" % (s, syms[s]["type"]), args)
             continue
         elif t == "R_ARM_GOT_BREL":
             if sym_map[s] == "local" or sym_map[s] == "exported":
@@ -187,7 +193,7 @@ def process(output, args):
     # There's a single mapping for any symbol, even if there are multiple relocations for the symbol
     reloc_name_to_idx = {}
     for e in rlist:
-        if not reloc_name_to_idx.has_key(e["name"]):
+        if e["name"] not in reloc_name_to_idx:
             reloc_name_to_idx[e["name"]] = lot_entries
             lot_entries += 1
             total_relocs += 1
@@ -203,11 +209,11 @@ def process(output, args):
                 ignored[s] = True
             continue
         if t == "R_ARM_ABS32":
-            offset = (offset - len(code_sect)) / 4
+            offset = (offset - len(code_sect)) // 4
             check(offset >= 0, "Offset of R_ARM_ABS32 symbols '%s' should be positive or 0!" % s)
             data_relocs.append((s, delta_off + offset, value))
             debug("Found data relocation for symbol '%s' (offset is %X, value is %x)" % (s, delta_off + offset, value), args)
-            if not reloc_name_to_idx.has_key(s):
+            if s not in reloc_name_to_idx:
                 reloc_name_to_idx[s] = delta_off + offset
                 total_relocs += 1
     print_list([l["name"] for l in rlist], "Final LOT relocation list:", args)
@@ -249,9 +255,9 @@ def process(output, args):
 
     set_debug_col('magenta')
     debug("%s Building image %s" % ('-' * 10, '-' * 10), args)
-    img = bytearray("UDLM") # Signature (4b)
+    img = bytearray(b"UDLM") # Signature (4b)
     # The first entry in the symbol table is always the module name
-    slist = [args.name] + [s for s in sym_map if reloc_name_to_idx.has_key(s) or sym_map[s] == "external" or sym_map[s] == "exported"]
+    slist = [args.name] + [s for s in sym_map if s in reloc_name_to_idx or sym_map[s] == "external" or sym_map[s] == "exported"]
     img += struct.pack("<H", lot_entries) # LOT size (4b)
     img += struct.pack("<H", total_relocs) # Total number of relocations (4b)
     # Compute len of symbol table in advance (also name to symbol table index mapping (symt_mapping))
@@ -312,16 +318,16 @@ def process(output, args):
     # Pass 2: write actual symbols
     for i, s in enumerate(slist):
         if i == 0 or sym_map[s] != "local":
-            img += s + '\0'
+            img += py3compat.str2bytes(s) + b'\0'
     # Round to a multiple of 4
     if len(img) % 4 > 0:
-        img += '\0' * (4 - len(img) % 4)
+        img += b'\0' * (4 - len(img) % 4)
     # And finally append the code
     img = img + code_sect + data_sect
     bin_name = args.name + ".bin"
     with open(bin_name, "wb") as f:
         f.write(img)
-    print "Image written to '%s'." % bin_name
+    print ("Image written to '%s'." % bin_name)
     set_debug_col()
     return bin_name
 
@@ -340,7 +346,7 @@ def gen_c_header(bin_name, header_path, args):
         f.write("static const unsigned char %s_module_data[] = {\n    " % fname)
         cnt = 0
         for idx, c in enumerate(bin_data):
-            f.write("0x%02X" % ord(c))
+            f.write("0x%02X" % py3compat.byte2int(c))
             if idx < len(bin_data) - 1:
                 f.write(",")
                 cnt += 1
@@ -361,6 +367,7 @@ parser.add_argument("--stop-after-compile", dest="stop_after_compile", action="s
 parser.add_argument("--stop-after-link", dest="stop_after_link", action="store_true", help="Stop after linking")
 parser.add_argument("--gen-c-header", dest="gen_c_header", action="store_true", help="Generate the C header after processing (default: false)")
 parser.add_argument("--header-path", dest="header_path", default=".", help="Path for the generated header (default: current dir)")
+parser.add_argument("--include-path", dest="include_paths", action='append', help="Includes paths (can be repeated)")
 parser.add_argument("--name", dest="name", default=None, help="Module name (default is inferred from the namae of first source)")
 args, rest = parser.parse_known_args()
 if len(rest) == 0:

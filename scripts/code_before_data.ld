@@ -15,14 +15,14 @@ SECTIONS
     . = ALIGN(4);
     *(.text)                 /* .text sections (code) */
     *(.text*)                /* .text* sections (code) */
-    *(.rodata)               /* .rodata sections (constants, strings, etc.) */
-    *(.rodata*)              /* .rodata* sections (constants, strings, etc.) */
     . = ALIGN(4);
   } > all
 
   .data :
   {
     . = ALIGN(4);
+    *(.rodata)               /* .rodata sections (constants, strings, etc.) */
+    *(.rodata*)              /* .rodata* sections (constants, strings, etc.) */
     *(.data)                 /* .data sections */
     *(.data*)                /* .data* sections */
     . = ALIGN(4);
